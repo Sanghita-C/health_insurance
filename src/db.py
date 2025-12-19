@@ -7,7 +7,11 @@ import hashlib
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
 
-from models import (
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.models import (
     get_session, 
     Customer, 
     DataSource, 

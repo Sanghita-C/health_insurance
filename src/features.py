@@ -1,29 +1,18 @@
-# Feature engineering module
+# Feature engineering module using SQLAlchemy ORM
 
-import uuid
-import psycopg2
-from psycopg2.extras import execute_batch
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import hashlib
 from datetime import datetime
+from sqlalchemy.exc import IntegrityError
+
+from src.models import get_session, HealthFeature
 
 
 # --------------------------------------------------
-# DB CONNECTION (Cloud SQL – Postgres)
-# --------------------------------------------------
-DB_CONFIG = {
-    "host": "YOUR_CLOUDSQL_PRIVATE_IP_OR_PUBLIC_IP",
-    "dbname": "postgres",
-    "user": "postgres",
-    "password": "YOUR_PASSWORD",
-    "port": 5432
-}
-
-
-def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
-
-
-# --------------------------------------------------
-# MAIN FEATURE PERSISTENCE FUNCTION
+# MAIN FEATURE PERSISTENCE FUNCTION (using ORM)
 # --------------------------------------------------
 def persist_features(
     health_data_id: str,
@@ -33,25 +22,40 @@ def persist_features(
 ):
     """
     Converts LLM output into normalized HEALTH_FEATURES rows
-    and inserts them into Postgres.
+    and inserts them into Postgres using SQLAlchemy ORM.
     """
 
-    rows = []
+    session = get_session()
+    features_to_add = []
     now = datetime.utcnow()
 
     def add_feature(feature_type, feature_name, feature_value, unit=None):
-        rows.append((
-            str(uuid.uuid4()),           # feature_id
-            health_data_id,
-            feature_type,
-            feature_name,
-            str(feature_value),
-            unit,
-            extraction_method,
-            None,                         # embedding_vector (optional)
-            model_version,
-            now
-        ))
+        # Generate a short feature_id (20 chars max) from health_data_id + feature info
+        feature_key = f"{health_data_id}_{feature_type}_{feature_name}_{feature_value}"
+        hash_obj = hashlib.md5(feature_key.encode())
+        feature_id = hash_obj.hexdigest()[:20]  # Use first 20 chars of MD5 hash
+        
+        # Check if feature already exists
+        existing = session.query(HealthFeature).filter(
+            HealthFeature.feature_id == feature_id
+        ).first()
+        
+        if existing:
+            return  # Skip if already exists
+        
+        feature = HealthFeature(
+            feature_id=feature_id,
+            health_data_id=health_data_id,
+            feature_type=feature_type,
+            feature_name=feature_name,
+            feature_value=str(feature_value),
+            unit=unit,
+            extraction_method=extraction_method,
+            embedding_vector=None,  # Optional
+            model_version=model_version,
+            created_timestamp=now
+        )
+        features_to_add.append(feature)
 
     # --------------------------------------------------
     # DEMOGRAPHIC FEATURES
@@ -112,34 +116,25 @@ def persist_features(
             llm_output["medical_department"]
         )
 
-    if not rows:
+    if not features_to_add:
         print(f"⚠️ No features generated for health_data_id={health_data_id}")
+        session.close()
         return
 
     # --------------------------------------------------
-    # INSERT INTO DB
+    # INSERT INTO DB USING ORM
     # --------------------------------------------------
-    insert_sql = """
-        INSERT INTO HEALTH_FEATURES (
-            feature_id,
-            health_data_id,
-            feature_type,
-            feature_name,
-            feature_value,
-            unit,
-            extraction_method,
-            embedding_vector,
-            model_version,
-            created_timestamp
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
-
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            execute_batch(cur, insert_sql, rows)
-        conn.commit()
-        print(f"✅ Inserted {len(rows)} features for {health_data_id}")
+        for feature in features_to_add:
+            session.add(feature)
+        session.commit()
+        print(f"✅ Inserted {len(features_to_add)} features for {health_data_id} using ORM")
+    except IntegrityError as e:
+        session.rollback()
+        print(f"⚠️ Some features may already exist for {health_data_id}: {e}")
+    except Exception as e:
+        session.rollback()
+        print(f"❌ Error inserting features for {health_data_id}: {e}")
+        raise
     finally:
-        conn.close()
+        session.close()

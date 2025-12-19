@@ -19,7 +19,7 @@ from vertexai.preview.generative_models import GenerativeModel
 
 PROJECT_ID = "rapid-rite-478023-j8"
 LOCATION = "us-central1"
-MODEL_NAME = "gemini-1.5-flash"   # cheap + fast, good for batch jobs
+MODEL_NAME = "gemini-2.0-flash-lite"   # cheap + fast, good for batch jobs
 
 # Initialize Vertex AI
 vertexai.init(project=PROJECT_ID, location=LOCATION)

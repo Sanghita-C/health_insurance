@@ -148,7 +148,8 @@ CREATE TABLE HEALTH_DATA (
     risk_level           VARCHAR(20),
     notes_summary        TEXT,
     data_quality_score   FLOAT,
-    embedding_path       VARCHAR(255)
+    embedding_path       VARCHAR(255),
+    processed_flag       VARCHAR(10) DEFAULT 'FALSE'
 );
 
 CREATE TABLE HEALTH_FEATURES (

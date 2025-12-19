@@ -15,13 +15,18 @@ Base = declarative_base()
 
 def get_database_url():
     """Construct database URL from environment variables or defaults"""
+    from urllib.parse import quote_plus
+    
     host = os.getenv("DB_HOST", "136.119.21.177")
     dbname = os.getenv("DB_NAME", "insurance_hybrid")
     user = os.getenv("DB_USER", "postgres")
     password = os.getenv("DB_PASSWORD", "santaClaude@876")
     port = os.getenv("DB_PORT", "5432")
     
-    return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+    # URL-encode password to handle special characters like @
+    password_encoded = quote_plus(password)
+    
+    return f"postgresql://{user}:{password_encoded}@{host}:{port}/{dbname}"
 
 def get_engine():
     """Create SQLAlchemy engine"""
@@ -102,6 +107,7 @@ class HealthData(Base):
     notes_summary = Column(Text, nullable=True)
     data_quality_score = Column(Float, nullable=True)
     embedding_path = Column(String(255), nullable=True)
+    processed_flag = Column(String(10), default='FALSE', nullable=True)  # Track processing status
     
     # Relationships
     customer = relationship("Customer", back_populates="health_data")
