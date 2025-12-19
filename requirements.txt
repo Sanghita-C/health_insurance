@@ -1,0 +1,7 @@
+# Python dependencies
+datasets
+google-cloud-storage
+pandas
+psycopg2-binary
+sqlalchemy
+
