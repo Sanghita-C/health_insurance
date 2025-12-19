@@ -1,6 +1,6 @@
 # Insurance Health ML- NYU Project
 # Course: Database Systems (CSCI-GA.2433-001)
-# Contributors: Sanghita Chakraborty, Arushi Srivastava
+# Contributors: Sanghita Chakraborty (sc11072), Arushi Srivastava (as19341)
 
 This project implements an end-to-end data management and analytics pipeline for processing unstructured clinical notes and transforming them into structured, queryable health insights. Built on Google Cloud Platform (GCP), the system integrates data ingestion, cloud storage, relational databases, large language models (LLMs), and analytical workflows to support downstream risk analysis and patient stratification.
 
