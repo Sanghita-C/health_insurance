@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import sys
+from google.cloud import storage
+from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Set style for better-looking plots
@@ -35,6 +37,10 @@ DB_CONFIG = {
 # Figures directory
 FIGURES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "reports", "figures")
 os.makedirs(FIGURES_DIR, exist_ok=True)
+
+# GCS Configuration
+BUCKET_NAME = "insurance_health_data"
+PROCESSED_ANALYTICS_PREFIX = "processed_analytics"
 
 N_CLUSTERS = 4
 MODEL_VERSION = "kmeans_v1"
@@ -270,6 +276,329 @@ def generate_plots(df: pd.DataFrame, clusters):
     logging.info(f"📊 All plots saved to {FIGURES_DIR}")
 
 # --------------------------------------------------
+# DEPARTMENT-BASED ANALYSIS
+# --------------------------------------------------
+
+def load_department_data():
+    """
+    Load data with medical department information
+    """
+    query = """
+    SELECT
+        hd.health_data_id,
+        MAX(CASE 
+            WHEN hf.feature_name = 'age' 
+            THEN CASE 
+                WHEN hf.feature_value ~ '^[0-9]+[.]?[0-9]*$' 
+                THEN hf.feature_value::FLOAT 
+                ELSE NULL 
+            END
+        END) AS age,
+        MAX(CASE 
+            WHEN hf.feature_name = 'risk_score' 
+            THEN CASE 
+                WHEN hf.feature_value ~ '^[0-9]+[.]?[0-9]*$' 
+                THEN hf.feature_value::FLOAT 
+                ELSE NULL 
+            END
+        END) AS risk_score,
+        MAX(CASE WHEN hf.feature_name = 'gender' THEN
+            CASE
+                WHEN LOWER(hf.feature_value) = 'male' THEN 1
+                WHEN LOWER(hf.feature_value) = 'female' THEN 0
+                ELSE -1
+            END
+        END) AS gender_encoded,
+        MAX(CASE WHEN hf.feature_name = 'medical_department' THEN hf.feature_value END) AS medical_department,
+        hd.disease_category
+    FROM health_data hd
+    JOIN health_features hf
+      ON hd.health_data_id = hf.health_data_id
+    WHERE hf.feature_name = 'medical_department' OR hf.feature_name IN ('age', 'risk_score', 'gender')
+    GROUP BY hd.health_data_id, hd.disease_category
+    HAVING MAX(CASE WHEN hf.feature_name = 'medical_department' THEN 1 ELSE 0 END) = 1
+    """
+
+    conn = get_connection()
+    df = pd.read_sql(query, conn)
+    conn.close()
+
+    return df
+
+def cluster_by_department(df: pd.DataFrame):
+    """
+    Perform clustering within each medical department
+    """
+    department_clusters = {}
+    department_stats = []
+    
+    # Get unique departments
+    departments = df['medical_department'].dropna().unique()
+    
+    for dept in departments:
+        dept_df = df[df['medical_department'] == dept].copy()
+        
+        if len(dept_df) < N_CLUSTERS:
+            logging.info(f"Skipping {dept}: insufficient data ({len(dept_df)} records)")
+            continue
+        
+        # Preprocess department data
+        dept_df = dept_df.dropna(subset=["age", "risk_score"]).copy()
+        dept_df["gender_encoded"] = dept_df["gender_encoded"].fillna(-1)
+        dept_df["disease_category"] = dept_df["disease_category"].fillna("Unknown")
+        dept_df["department_encoded"] = dept_df["disease_category"].astype("category").cat.codes
+        
+        if len(dept_df) < N_CLUSTERS:
+            continue
+        
+        features = dept_df[["age", "risk_score", "gender_encoded", "department_encoded"]]
+        features = features.fillna(0)
+        
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(features)
+        
+        # Cluster within department
+        model = KMeans(n_clusters=min(N_CLUSTERS, len(dept_df)), random_state=42, n_init="auto")
+        dept_clusters = model.fit_predict(X_scaled)
+        
+        dept_df['cluster'] = dept_clusters
+        department_clusters[dept] = dept_df
+        
+        # Calculate statistics
+        for cluster_id in range(len(set(dept_clusters))):
+            cluster_data = dept_df[dept_df['cluster'] == cluster_id]
+            department_stats.append({
+                'department': dept,
+                'cluster': cluster_id,
+                'count': len(cluster_data),
+                'avg_age': cluster_data['age'].mean(),
+                'avg_risk': cluster_data['risk_score'].mean(),
+                'std_age': cluster_data['age'].std(),
+                'std_risk': cluster_data['risk_score'].std()
+            })
+    
+    return department_clusters, pd.DataFrame(department_stats)
+
+def generate_department_plots(department_clusters: dict, department_stats: pd.DataFrame):
+    """
+    Generate visualizations for department-based clustering
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 1. Department Cluster Counts
+    plt.figure(figsize=(14, 8))
+    dept_counts = {}
+    for dept, df in department_clusters.items():
+        dept_counts[dept] = df['cluster'].value_counts().sort_index()
+    
+    dept_df_counts = pd.DataFrame(dept_counts).T
+    dept_df_counts.plot(kind='bar', stacked=False, colormap='tab10', figsize=(14, 8))
+    plt.xlabel('Medical Department')
+    plt.ylabel('Number of Records')
+    plt.title('Cluster Distribution by Medical Department')
+    plt.legend(title='Cluster ID', bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIGURES_DIR, f'department_cluster_distribution_{timestamp}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    logging.info(f"✅ Saved department cluster distribution plot")
+    
+    # 2. Average Risk Score by Department and Cluster
+    if not department_stats.empty:
+        plt.figure(figsize=(14, 8))
+        pivot_risk = department_stats.pivot(index='department', columns='cluster', values='avg_risk')
+        sns.heatmap(pivot_risk, annot=True, fmt='.3f', cmap='RdYlGn_r', cbar_kws={'label': 'Average Risk Score'})
+        plt.title('Average Risk Score by Department and Cluster')
+        plt.xlabel('Cluster ID')
+        plt.ylabel('Medical Department')
+        plt.tight_layout()
+        plt.savefig(os.path.join(FIGURES_DIR, f'department_risk_heatmap_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        logging.info(f"✅ Saved department risk heatmap")
+        
+        # 3. Average Age by Department and Cluster
+        plt.figure(figsize=(14, 8))
+        pivot_age = department_stats.pivot(index='department', columns='cluster', values='avg_age')
+        sns.heatmap(pivot_age, annot=True, fmt='.1f', cmap='Blues', cbar_kws={'label': 'Average Age'})
+        plt.title('Average Age by Department and Cluster')
+        plt.xlabel('Cluster ID')
+        plt.ylabel('Medical Department')
+        plt.tight_layout()
+        plt.savefig(os.path.join(FIGURES_DIR, f'department_age_heatmap_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        logging.info(f"✅ Saved department age heatmap")
+    
+    # 4. Risk Score Comparison Across Departments
+    plt.figure(figsize=(16, 10))
+    all_dept_data = []
+    for dept, df in department_clusters.items():
+        for cluster_id in df['cluster'].unique():
+            cluster_data = df[df['cluster'] == cluster_id]
+            all_dept_data.append({
+                'department': dept,
+                'cluster': f'Cluster {cluster_id}',
+                'risk_score': cluster_data['risk_score'].values
+            })
+    
+    if all_dept_data:
+        dept_risk_df = pd.DataFrame(all_dept_data)
+        dept_risk_df = dept_risk_df.explode('risk_score')
+        dept_risk_df['risk_score'] = pd.to_numeric(dept_risk_df['risk_score'], errors='coerce')
+        dept_risk_df = dept_risk_df.dropna()
+        
+        if not dept_risk_df.empty:
+            sns.boxplot(data=dept_risk_df, x='department', y='risk_score', hue='cluster')
+            plt.title('Risk Score Distribution by Department and Cluster')
+            plt.xlabel('Medical Department')
+            plt.ylabel('Risk Score')
+            plt.xticks(rotation=45, ha='right')
+            plt.legend(title='Cluster', bbox_to_anchor=(1.05, 1), loc='upper left')
+            plt.grid(axis='y', alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(FIGURES_DIR, f'department_risk_boxplot_{timestamp}.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+            logging.info(f"✅ Saved department risk boxplot")
+    
+    # 5. Department Summary Statistics
+    if not department_stats.empty:
+        plt.figure(figsize=(16, 10))
+        summary_stats = department_stats.groupby('department').agg({
+            'count': 'sum',
+            'avg_risk': 'mean',
+            'avg_age': 'mean'
+        }).round(2)
+        
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Total records per department
+        summary_stats['count'].plot(kind='bar', ax=axes[0], color='steelblue')
+        axes[0].set_title('Total Records per Department')
+        axes[0].set_ylabel('Number of Records')
+        axes[0].tick_params(axis='x', rotation=45)
+        axes[0].grid(axis='y', alpha=0.3)
+        
+        # Average risk per department
+        summary_stats['avg_risk'].plot(kind='bar', ax=axes[1], color='coral')
+        axes[1].set_title('Average Risk Score per Department')
+        axes[1].set_ylabel('Risk Score')
+        axes[1].tick_params(axis='x', rotation=45)
+        axes[1].grid(axis='y', alpha=0.3)
+        
+        # Average age per department
+        summary_stats['avg_age'].plot(kind='bar', ax=axes[2], color='lightgreen')
+        axes[2].set_title('Average Age per Department')
+        axes[2].set_ylabel('Age (years)')
+        axes[2].tick_params(axis='x', rotation=45)
+        axes[2].grid(axis='y', alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(FIGURES_DIR, f'department_summary_stats_{timestamp}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        logging.info(f"✅ Saved department summary statistics")
+    
+    logging.info(f"📊 All department analysis plots saved to {FIGURES_DIR}")
+
+# --------------------------------------------------
+# UPLOAD FIGURES TO GCS
+# --------------------------------------------------
+
+def upload_figures_to_gcs(date_partition=None, time_partition=None):
+    """
+    Upload all figures from local figures directory to GCS bucket
+    partitioned by date and time.
+    
+    Args:
+        date_partition: Date string in YYYY-MM-DD format. If None, uses today's date.
+        time_partition: Time string in HHMMSS format. If None, uses current time.
+    """
+    if date_partition is None:
+        date_partition = datetime.now().strftime("%Y-%m-%d")
+    
+    if time_partition is None:
+        time_partition = datetime.now().strftime("%H%M%S")
+    
+    # Initialize GCS client
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    
+    # Get all PNG files from figures directory
+    figures_path = Path(FIGURES_DIR)
+    figure_files = list(figures_path.glob("*.png"))
+    
+    if not figure_files:
+        logging.warning(f"No figure files found in {FIGURES_DIR}")
+        return
+    
+    uploaded_count = 0
+    failed_count = 0
+    
+    # Create partition path: processed_analytics/YYYY-MM-DD/HHMMSS/
+    partition_path = f"{PROCESSED_ANALYTICS_PREFIX}/{date_partition}/{time_partition}"
+    
+    logging.info(f"Uploading {len(figure_files)} figures to GCS...")
+    logging.info(f"Destination: gs://{BUCKET_NAME}/{partition_path}/")
+    
+    for figure_file in figure_files:
+        try:
+            # Create GCS blob path: processed_analytics/YYYY-MM-DD/HHMMSS/filename.png
+            blob_path = f"{partition_path}/{figure_file.name}"
+            
+            # Upload file
+            blob = bucket.blob(blob_path)
+            blob.upload_from_filename(str(figure_file))
+            
+            # Set content type for proper display in browser
+            blob.content_type = "image/png"
+            blob.patch()
+            
+            uploaded_count += 1
+            logging.info(f"  ✅ Uploaded: {figure_file.name}")
+            
+        except Exception as e:
+            failed_count += 1
+            logging.error(f"  ❌ Failed to upload {figure_file.name}: {e}")
+    
+    logging.info(f"📤 Upload complete: {uploaded_count} successful, {failed_count} failed")
+    logging.info(f"📍 Figures available at: gs://{BUCKET_NAME}/{partition_path}/")
+
+def run_department_analysis():
+    """
+    Run department-based clustering and analysis
+    """
+    logging.info("Loading department data...")
+    df = load_department_data()
+    
+    if df.empty or df['medical_department'].isna().all():
+        logging.warning("No department data available. Skipping department analysis.")
+        return
+    
+    logging.info(f"Found {len(df)} records with department information")
+    logging.info(f"Departments: {df['medical_department'].dropna().unique()}")
+    
+    logging.info("Clustering by department...")
+    department_clusters, department_stats = cluster_by_department(df)
+    
+    if not department_clusters:
+        logging.warning("No valid department clusters created. Skipping visualizations.")
+        return
+    
+    logging.info(f"Created clusters for {len(department_clusters)} departments")
+    logging.info("Generating department visualizations...")
+    generate_department_plots(department_clusters, department_stats)
+    
+    # Print summary statistics
+    logging.info("\n=== DEPARTMENT CLUSTERING SUMMARY ===")
+    for dept, dept_df in department_clusters.items():
+        logging.info(f"\n{dept}:")
+        logging.info(f"  Total records: {len(dept_df)}")
+        for cluster_id in sorted(dept_df['cluster'].unique()):
+            cluster_data = dept_df[dept_df['cluster'] == cluster_id]
+            logging.info(f"  Cluster {cluster_id}: {len(cluster_data)} records, "
+                        f"Avg Age: {cluster_data['age'].mean():.1f}, "
+                        f"Avg Risk: {cluster_data['risk_score'].mean():.3f}")
+
+# --------------------------------------------------
 # MAIN PIPELINE
 # --------------------------------------------------
 
@@ -288,6 +617,12 @@ def run_analytics():
 
     logging.info("Generating visualizations...")
     generate_plots(df, clusters)
+
+    logging.info("Running department-based analysis...")
+    run_department_analysis()
+
+    logging.info("Uploading figures to GCS...")
+    upload_figures_to_gcs()
 
     logging.info("Analytics pipeline completed.")
 
